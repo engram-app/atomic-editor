@@ -743,6 +743,109 @@ function getAllCells(wrap: HTMLElement): HTMLElement[] {
   return Array.from(wrap.querySelectorAll<HTMLElement>('th, td'));
 }
 
+// ---- vertical arrow navigation ---------------------------------------
+// The table is an atomic block widget to the outer editor, so ArrowDown/Up
+// on the neighbouring line used to jump straight over it, and inside a cell
+// the arrows never left it. These helpers make the table a normal stop in
+// the vertical caret path. `dir` is -1 (up) or +1 (down).
+
+function placeCaretAtStart(el: HTMLElement): void {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(true);
+  const sel = window.getSelection();
+  if (!sel) return;
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+// A wrapped cell has several visual lines; only the first/last one may hand
+// the caret to the neighbouring row. No layout (collapsed rect) => assume a
+// single line.
+function caretOnEdgeLine(source: HTMLElement, dir: -1 | 1): boolean {
+  const sel = source.ownerDocument.defaultView?.getSelection();
+  if (!sel || sel.rangeCount === 0) return true;
+  const range = sel.getRangeAt(0);
+  const caret = range.getClientRects()[0] ?? range.getBoundingClientRect();
+  if (!caret || !caret.height) return true;
+  const box = source.getBoundingClientRect();
+  const slack = caret.height * 0.75;
+  return dir < 0 ? caret.top - box.top < slack : box.bottom - caret.bottom < slack;
+}
+
+// Arrow pressed inside a cell: move to the cell above/below in the same
+// column, or step out to the line above/below the table. Returns false when
+// the browser should handle the key (cell has more lines in that direction).
+function arrowFromCell(view: EditorView, cell: HTMLElement, dir: -1 | 1): boolean {
+  const wrap = cell.closest<HTMLElement>('.cm-atomic-table');
+  const source = getCellSource(cell);
+  if (!wrap || !source || !caretOnEdgeLine(source, dir)) return false;
+  const cells = getAllCells(wrap);
+  const idx = cells.indexOf(cell);
+  if (idx < 0) return false;
+  const cols = wrap.querySelectorAll('thead th').length || 1;
+  const target = cells[idx + dir * cols];
+  if (target) {
+    const offset = getCaretCharOffset(source);
+    const next = getCellSource(target);
+    if (!next) return false;
+    next.focus();
+    placeCaretAtStart(next);
+    if (offset != null) setCaretCharOffset(next, offset);
+    updateActiveMarkForSource(next);
+    return true;
+  }
+  const range = findCurrentTableRange(view, wrap);
+  if (!range) return false;
+  const docLen = view.state.doc.length;
+  // Table flush against the doc edge: nowhere to go, but swallow the key so
+  // the browser doesn't move the caret out of the contenteditable.
+  if (dir < 0 ? range.from === 0 : range.to >= docLen) return true;
+  const pos = dir < 0 ? range.from - 1 : Math.min(range.to + 1, docLen);
+  view.dispatch({ selection: { anchor: pos }, scrollIntoView: true });
+  view.focus();
+  return true;
+}
+
+// Arrow pressed in the document on the line directly above/below a table:
+// enter it (first cell going down, last row going up).
+function arrowIntoTable(dir: -1 | 1): (view: EditorView) => boolean {
+  return (view) => {
+    const { state } = view;
+    if (state.facet(readOnlyFacet)) return false;
+    const sel = state.selection.main;
+    if (!sel.empty) return false;
+    const line = state.doc.lineAt(sel.head);
+    // On a soft-wrapped line the arrow moves to the next visual row first;
+    // only the last row hands the caret to the table.
+    const next = view.moveVertically(sel, dir > 0).head;
+    if (next !== sel.head && next >= line.from && next <= line.to) return false;
+    const edge = dir > 0 ? line.to + 1 : line.from - 1;
+    const hits: { from: number; to: number }[] = [];
+    state.field(tableField, false)?.between(edge, edge, (from, to) => {
+      if (dir > 0 ? from === edge : to === edge) hits.push({ from, to });
+    });
+    const hit = hits[0];
+    if (!hit) return false;
+    const wrap = Array.from(
+      view.contentDOM.querySelectorAll<HTMLElement>('.cm-atomic-table'),
+    ).find((w) => {
+      const pos = view.posAtDOM(w);
+      return pos >= hit.from && pos <= hit.to;
+    });
+    if (!wrap) return false;
+    const cells = getAllCells(wrap);
+    const cols = wrap.querySelectorAll('thead th').length || 1;
+    const first = cells[dir > 0 ? 0 : cells.length - cols];
+    const source = first ? getCellSource(first) : null;
+    if (!source) return false;
+    source.focus();
+    placeCaretAtStart(source);
+    updateActiveMarkForSource(source);
+    return true;
+  };
+}
+
 // ---- widget ---------------------------------------------------------
 
 class TableWidget extends WidgetType {
@@ -988,6 +1091,17 @@ function attachCellEditing(
   source.addEventListener('blur', () => clearActiveMarksInSource(source));
 
   source.addEventListener('keydown', (event) => {
+    if (
+      (event.key === 'ArrowUp' || event.key === 'ArrowDown') &&
+      !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey &&
+      !composing && !event.isComposing
+    ) {
+      if (arrowFromCell(view, cell, event.key === 'ArrowUp' ? -1 : 1)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
+    }
     // Enter mirrors Tab — advance to the next cell (appending a row past
     // the last one) instead of inserting a line break a single-line cell
     // can't represent. Shift reverses direction for both.
@@ -1489,6 +1603,12 @@ export function tables(config: TablesConfig = {}): Extension {
       ? [tableWikiLinkClickFacet.of(config.onWikiLinkClick)]
       : []),
     // Prec.high so we run before the default Backspace binding.
-    Prec.high(keymap.of([{ key: 'Backspace', run: backspaceAtTableBoundary }])),
+    Prec.high(
+      keymap.of([
+        { key: 'Backspace', run: backspaceAtTableBoundary },
+        { key: 'ArrowDown', run: arrowIntoTable(1) },
+        { key: 'ArrowUp', run: arrowIntoTable(-1) },
+      ]),
+    ),
   ];
 }
