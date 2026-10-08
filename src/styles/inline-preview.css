@@ -835,3 +835,19 @@
 .cm-atomic-comment {
   color: var(--atomic-editor-fg-faint, #767676);
 }
+
+/* Column alignment from the separator row (`:--`, `:-:`, `--:`). */
+.cm-atomic-table th[data-align="left"],
+.cm-atomic-table td[data-align="left"] {
+  text-align: left;
+}
+
+.cm-atomic-table th[data-align="center"],
+.cm-atomic-table td[data-align="center"] {
+  text-align: center;
+}
+
+.cm-atomic-table th[data-align="right"],
+.cm-atomic-table td[data-align="right"] {
+  text-align: right;
+}

@@ -52,9 +52,19 @@ import { readOnlyFacet } from './read-only';
 
 // ---- model / parse / serialize --------------------------------------
 
+type Align = 'left' | 'center' | 'right' | null;
+
 interface TableModel {
   header: string[];
   rows: string[][];
+  /** Per-column alignment from the separator row; absent = all unaligned. */
+  align?: Align[];
+}
+
+// What `readModelFromDom` returns: alignment is always present, so
+// structural edits can splice it alongside the header and rows.
+interface DomTableModel extends TableModel {
+  align: Align[];
 }
 
 function collectCells(state: EditorState, rowNode: SyntaxNode): string[] {
@@ -96,9 +106,22 @@ export function splitRowCells(line: string): string[] {
   return cells;
 }
 
+// Per-column alignment from the separator row: `:--` left, `:-:` center,
+// `--:` right, `---` none (null).
+function parseAlign(line: string, columnCount: number): Align[] {
+  const align = splitRowCells(line).map((c): Align => {
+    const l = c.startsWith(':');
+    const r = c.endsWith(':');
+    return l && r ? 'center' : r ? 'right' : l ? 'left' : null;
+  });
+  while (align.length < columnCount) align.push(null);
+  return align.slice(0, columnCount);
+}
+
 function parseTable(state: EditorState, tableNode: SyntaxNode): TableModel | null {
   const header: string[] = [];
   const rows: string[][] = [];
+  let delimiterLine = '';
 
   const cursor = tableNode.cursor();
   if (!cursor.firstChild()) return null;
@@ -108,12 +131,15 @@ function parseTable(state: EditorState, tableNode: SyntaxNode): TableModel | nul
       header.push(...collectCells(state, cursor.node));
     } else if (cursor.name === 'TableRow') {
       rows.push(collectCells(state, cursor.node));
+    } else if (cursor.name === 'TableDelimiter') {
+      // Top-level delimiter = the `|---|:-:|` separator row (the per-row
+      // `|` delimiters are children of their rows, not visited here).
+      delimiterLine = state.doc.lineAt(cursor.from).text;
     }
-    // TableDelimiter (per-row `|` and whole-line `|---|---|`) is ignored.
   } while (cursor.nextSibling());
 
   if (header.length === 0) return null;
-  return { header, rows };
+  return { header, rows, align: parseAlign(delimiterLine, header.length) };
 }
 
 // Escape cell content so it can't break the row's GFM structure: an
@@ -125,11 +151,15 @@ function escapeCell(text: string): string {
   return text.replace(/\r?\n/g, ' ').replace(/(?<!\\)\|/g, '\\|');
 }
 
+function alignSeparator(align: Align | undefined): string {
+  return align === 'center' ? ':---:' : align === 'right' ? '---:' : align === 'left' ? ':---' : '---';
+}
+
 export function serializeTable(model: TableModel): string {
   const columnCount = model.header.length;
   const lines: string[] = [];
   lines.push('| ' + model.header.map(escapeCell).join(' | ') + ' |');
-  lines.push('| ' + model.header.map(() => '---').join(' | ') + ' |');
+  lines.push('| ' + model.header.map((_, i) => alignSeparator(model.align?.[i])).join(' | ') + ' |');
   for (const row of model.rows) {
     const padded: string[] = [];
     for (let c = 0; c < columnCount; c++) padded.push(escapeCell(row[c] ?? ''));
@@ -138,15 +168,15 @@ export function serializeTable(model: TableModel): string {
   return lines.join('\n');
 }
 
-function readModelFromDom(wrap: HTMLElement): TableModel {
-  const header = Array.from(wrap.querySelectorAll<HTMLElement>('thead th')).map(
-    readCellSource,
-  );
+function readModelFromDom(wrap: HTMLElement): DomTableModel {
+  const ths = Array.from(wrap.querySelectorAll<HTMLElement>('thead th'));
+  const header = ths.map(readCellSource);
+  const align = ths.map((th): Align => (th.dataset.align as Align | undefined) || null);
   const rows = Array.from(wrap.querySelectorAll<HTMLElement>('tbody tr')).map(
     (tr) =>
       Array.from(tr.querySelectorAll<HTMLElement>('td')).map(readCellSource),
   );
-  return { header, rows };
+  return { header, rows, align };
 }
 
 // A cell's raw markdown lives in `dataset.raw` — the source of truth
@@ -733,6 +763,9 @@ class TableWidget extends WidgetType {
     if (other.readOnly !== this.readOnly) return false;
     if (other.model.header.length !== this.model.header.length) return false;
     if (other.model.rows.length !== this.model.rows.length) return false;
+    // Alignment lives in the separator row, not the cells, so a change there
+    // must rebuild the DOM (cells carry it as data-align).
+    if (JSON.stringify(other.model.align) !== JSON.stringify(this.model.align)) return false;
     return true;
   }
 
@@ -745,9 +778,15 @@ class TableWidget extends WidgetType {
 
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    for (const text of this.model.header) {
-      headerRow.appendChild(makeCell('th', text, view));
-    }
+    const align = this.model.align ?? [];
+    const aligned = (cell: HTMLElement, c: number): HTMLElement => {
+      const a = align[c];
+      if (a) cell.dataset.align = a;
+      return cell;
+    };
+    this.model.header.forEach((text, c) => {
+      headerRow.appendChild(aligned(makeCell('th', text, view), c));
+    });
     thead.appendChild(headerRow);
     table.appendChild(thead);
 
@@ -756,7 +795,7 @@ class TableWidget extends WidgetType {
     for (const row of this.model.rows) {
       const tr = document.createElement('tr');
       for (let c = 0; c < colCount; c++) {
-        tr.appendChild(makeCell('td', row[c] ?? '', view));
+        tr.appendChild(aligned(makeCell('td', row[c] ?? '', view), c));
       }
       tbody.appendChild(tr);
     }
