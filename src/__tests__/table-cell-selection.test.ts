@@ -621,6 +621,12 @@ describe("pasting a grid with the caret in a cell", () => {
 		expect(table()).toBe(`${HEADER}| 1 | x | y |\n| 4 | z | w |`);
 	});
 
+	test("a copied table column (HTML table, no tabs) pastes as rows", () => {
+		mount();
+		pasteInCell(3, "p\nq", "<table><tr><td>p</td></tr><tr><td>q</td></tr></table>");
+		expect(table()).toBe(`${HEADER}| p | 2 | 3 |\n| q | 5 | 6 |`);
+	});
+
 	test("plain multi-line text without tabs is still flattened into the one cell", () => {
 		mount();
 		pasteInCell(3, "hello\nworld");

@@ -699,6 +699,13 @@ function refreshCellPreview(cell: HTMLElement): void {
 // range. Walk the tree from there to find the enclosing Table node so
 // our dispatch targets the current range (positions shift as the user
 // types — we can't rely on the from/to captured at widget creation).
+// True when clipboard HTML holds a table of more than one cell. Pages and mail
+// clients wrap ordinary text in a one-cell table, which is not a grid.
+function isHtmlGrid(html: string): boolean {
+  if (!/<table/i.test(html)) return false;
+  return new DOMParser().parseFromString(html, 'text/html').querySelectorAll('td, th').length > 1;
+}
+
 function findCurrentTableRange(
   view: EditorView,
   dom: HTMLElement,
@@ -1804,10 +1811,15 @@ function attachCellEditing(
   // and strip markup here, and `escapeCell` neutralizes any literal `|`
   // on serialize.
   source.addEventListener('paste', (event) => {
-    // Spreadsheet-style grid (tabs): spread it across cells from this one
-    // instead of flattening it into a single cell.
+    // Spreadsheet-style grid (tabs, or a copied HTML table of several cells):
+    // spread it across cells from this one instead of flattening it into a
+    // single cell. Web HTML that wraps its text in a one-cell <table> stays a
+    // plain paste.
     const data = event.clipboardData;
-    if (data && /\t/.test(data.getData('text/plain'))) {
+    if (
+      data &&
+      (/\t/.test(data.getData('text/plain')) || isHtmlGrid(data.getData('text/html')))
+    ) {
       const grid = parseClipboardGrid(data.getData('text/plain'));
       if (grid && (grid.length > 1 || grid[0].length > 1)) {
         event.preventDefault();
