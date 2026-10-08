@@ -1840,15 +1840,6 @@ function attachCellEditing(
 
 // ---- context menu -------------------------------------------------
 
-function cellRowIndex(cell: HTMLElement): number {
-  // Rows are indexed within tbody (header isn't a "row" we can
-  // insert-above; header context items are column-only).
-  const tr = cell.closest<HTMLElement>('tr');
-  const tbody = tr?.closest<HTMLElement>('tbody');
-  if (!tr || !tbody) return -1;
-  return Array.from(tbody.querySelectorAll<HTMLElement>('tr')).indexOf(tr);
-}
-
 function cellColIndex(cell: HTMLElement): number {
   const tr = cell.closest<HTMLElement>('tr');
   if (!tr) return -1;
@@ -1874,6 +1865,98 @@ function dispatchModel(
   });
 }
 
+// Sort the body rows by a column. Numbers compare by value ("2" < "10"), text
+// case-insensitively; empty cells go last in both directions. Stable.
+function sortTableByColumn(
+  view: EditorView,
+  wrap: HTMLElement,
+  col: number,
+  dir: 1 | -1,
+): void {
+  const tbody = wrap.querySelector('tbody');
+  if (!tbody) return;
+  const keyed = Array.from(tbody.querySelectorAll<HTMLElement>('tr')).map((tr, i) => ({
+    tr,
+    i,
+    text: readCellSource((tr.children[col] as HTMLElement | undefined) ?? tr),
+  }));
+  keyed.sort((a, b) => {
+    if (!a.text !== !b.text) return a.text ? -1 : 1;
+    const cmp = a.text.localeCompare(b.text, undefined, { numeric: true, sensitivity: 'base' });
+    return cmp * dir || a.i - b.i;
+  });
+  tbody.append(...keyed.map((k) => k.tr));
+  syncHandles(view, wrap);
+  const any = wrap.querySelector<HTMLElement>('th, td');
+  if (any) dispatchModelFromDom(view, any, 'table.edit');
+}
+
+// Set one column's alignment (left / center / right) on its cells, then sync
+// the separator row in the document.
+function setColumnAlign(
+  view: EditorView,
+  wrap: HTMLElement,
+  col: number,
+  align: 'left' | 'center' | 'right',
+): void {
+  for (const tr of wrap.querySelectorAll('tr')) {
+    const cell = tr.children[col];
+    if (cell instanceof HTMLElement) cell.dataset.align = align;
+  }
+  const any = wrap.querySelector<HTMLElement>('th, td');
+  if (any) dispatchModelFromDom(view, any, 'table.edit');
+}
+
+// 24x24 stroke icons (inner SVG markup) for the context menu.
+const MENU_ICONS = {
+  rows: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18"/><path d="M3 15h18"/>',
+  columns: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path d="M15 4v16"/>',
+  sort: '<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>',
+  align: '<path d="M21 6H3"/><path d="M15 12H3"/><path d="M17 18H3"/>',
+  chevron: '<path d="m9 6 6 6-6 6"/>',
+  trash:
+    '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  up: '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>',
+  down: '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',
+  left: '<path d="M19 12H5"/><path d="m12 19-7-7 7-7"/>',
+  right: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
+  insertAbove: '<rect x="3" y="12" width="18" height="9" rx="2"/><path d="M12 3v6"/><path d="M9 6h6"/>',
+  insertBelow: '<rect x="3" y="3" width="18" height="9" rx="2"/><path d="M12 15v6"/><path d="M9 18h6"/>',
+  insertLeft: '<rect x="12" y="3" width="9" height="18" rx="2"/><path d="M3 12h6"/><path d="M6 9v6"/>',
+  insertRight: '<rect x="3" y="3" width="9" height="18" rx="2"/><path d="M15 12h6"/><path d="M18 9v6"/>',
+  sortAsc:
+    '<path d="m3 8 4-4 4 4"/><path d="M7 4v16"/><path d="M11 12h4"/><path d="M11 16h7"/><path d="M11 20h10"/>',
+  sortDesc:
+    '<path d="m3 16 4 4 4-4"/><path d="M7 20V4"/><path d="M11 4h10"/><path d="M11 8h7"/><path d="M11 12h4"/>',
+  alignLeft: '<path d="M21 6H3"/><path d="M15 12H3"/><path d="M17 18H3"/>',
+  alignCenter: '<path d="M21 6H3"/><path d="M17 12H7"/><path d="M19 18H5"/>',
+  alignRight: '<path d="M21 6H3"/><path d="M21 12H9"/><path d="M21 18H7"/>',
+} as const;
+
+type MenuIconName = keyof typeof MENU_ICONS;
+
+function menuIcon(name: MenuIconName): HTMLElement {
+  const span = document.createElement('span');
+  span.className = 'cm-atomic-table-menu-icon';
+  span.setAttribute('aria-hidden', 'true');
+  // Static, module-owned markup (no user content).
+  span.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${MENU_ICONS[name]}</svg>`;
+  return span;
+}
+
+interface MenuItem {
+  label: string;
+  icon: MenuIconName;
+  action: () => void;
+  disabled?: boolean;
+}
+
+interface MenuGroup {
+  label: string;
+  icon: MenuIconName;
+  items: MenuItem[];
+}
+
 function openCellMenu(
   view: EditorView,
   cell: HTMLElement,
@@ -1882,82 +1965,131 @@ function openCellMenu(
 ): void {
   const wrap = cell.closest<HTMLElement>('.cm-atomic-table');
   if (!wrap) return;
-  const isHeader = cell.tagName === 'TH';
-  const row = cellRowIndex(cell);
+  const row = rowAllIndex(cell); // header = 0
   const col = cellColIndex(cell);
+  const rowTotal = wrap.querySelectorAll('tr').length;
+  const colCount = wrap.querySelectorAll('thead th').length;
 
   const menu = document.createElement('div');
   menu.className = 'cm-atomic-table-menu';
+  menu.setAttribute('role', 'menu');
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
 
-  type MenuItem = { label: string; action: () => void } | 'separator';
-  const items: MenuItem[] = [];
+  const insertColumn = (at: number) => () => {
+    const m = readModelFromDom(wrap);
+    m.header.splice(at, 0, '');
+    m.align.splice(at, 0, null);
+    for (const r of m.rows) r.splice(at, 0, '');
+    dispatchModel(view, wrap, m);
+  };
 
-  if (!isHeader) {
-    items.push({
-      label: 'Insert row above',
-      action: () => {
-        const m = readModelFromDom(wrap);
-        m.rows.splice(row, 0, m.header.map(() => ''));
-        dispatchModel(view, wrap, m);
-      },
-    });
-    items.push({
-      label: 'Insert row below',
-      action: () => {
-        const m = readModelFromDom(wrap);
-        m.rows.splice(row + 1, 0, m.header.map(() => ''));
-        dispatchModel(view, wrap, m);
-      },
-    });
-    items.push({
-      label: 'Delete row',
-      action: () => {
-        const m = readModelFromDom(wrap);
-        if (row >= 0 && row < m.rows.length) m.rows.splice(row, 1);
-        dispatchModel(view, wrap, m);
-      },
-    });
-    items.push('separator');
-  }
-
-  items.push({
-    label: 'Insert column left',
-    action: () => {
-      const m = readModelFromDom(wrap);
-      m.header.splice(col, 0, '');
-      for (const r of m.rows) r.splice(col, 0, '');
-      dispatchModel(view, wrap, m);
+  // Row / Column / Sort / Align sub-menus, like Obsidian's. Every action works
+  // on every row, the header included (see editRows).
+  const blankRow = (list: string[][]) => list[0].map(() => '');
+  const alignItems: [label: string, align: 'left' | 'center' | 'right', icon: MenuIconName][] = [
+    ['Align left', 'left', 'alignLeft'],
+    ['Align center', 'center', 'alignCenter'],
+    ['Align right', 'right', 'alignRight'],
+  ];
+  const groups: MenuGroup[] = [
+    {
+      label: 'Row',
+      icon: 'rows',
+      items: [
+        {
+          label: 'Insert row above',
+          icon: 'insertAbove',
+          action: () => editRows(view, wrap, (list) => list.splice(row, 0, blankRow(list))),
+        },
+        {
+          label: 'Insert row below',
+          icon: 'insertBelow',
+          action: () => editRows(view, wrap, (list) => list.splice(row + 1, 0, blankRow(list))),
+        },
+        {
+          label: 'Move row up',
+          icon: 'up',
+          disabled: row <= 0,
+          action: () => moveTableLine(view, wrap, 'row', row, row - 1),
+        },
+        {
+          label: 'Move row down',
+          icon: 'down',
+          disabled: row >= rowTotal - 1,
+          action: () => moveTableLine(view, wrap, 'row', row, row + 1),
+        },
+        {
+          label: 'Delete row',
+          icon: 'trash',
+          action: () =>
+            editRows(view, wrap, (list) => {
+              // A table needs a header: with only one row left, clear it.
+              if (list.length <= 1) list[0] = blankRow(list);
+              else list.splice(row, 1);
+            }),
+        },
+      ],
     },
-  });
-  items.push({
-    label: 'Insert column right',
-    action: () => {
-      const m = readModelFromDom(wrap);
-      m.header.splice(col + 1, 0, '');
-      for (const r of m.rows) r.splice(col + 1, 0, '');
-      dispatchModel(view, wrap, m);
+    {
+      label: 'Column',
+      icon: 'columns',
+      items: [
+        { label: 'Insert column left', icon: 'insertLeft', action: insertColumn(col) },
+        { label: 'Insert column right', icon: 'insertRight', action: insertColumn(col + 1) },
+        {
+          label: 'Move column left',
+          icon: 'left',
+          disabled: col <= 0,
+          action: () => moveTableLine(view, wrap, 'col', col, col - 1),
+        },
+        {
+          label: 'Move column right',
+          icon: 'right',
+          disabled: col >= colCount - 1,
+          action: () => moveTableLine(view, wrap, 'col', col, col + 1),
+        },
+        {
+          label: 'Delete column',
+          icon: 'trash',
+          action: () => {
+            const m = readModelFromDom(wrap);
+            // Guard: don't leave the table with zero columns — lezer
+            // wouldn't re-parse that as a Table and the widget would
+            // vanish mid-edit. Keeping the last column as the floor.
+            if (m.header.length <= 1 || col < 0) return;
+            m.header.splice(col, 1);
+            m.align.splice(col, 1);
+            for (const r of m.rows) r.splice(col, 1);
+            dispatchModel(view, wrap, m);
+          },
+        },
+      ],
     },
-  });
-  items.push({
-    label: 'Delete column',
-    action: () => {
-      const m = readModelFromDom(wrap);
-      // Guard: don't leave the table with zero columns — lezer
-      // wouldn't re-parse that as a Table and the widget would
-      // vanish mid-edit. Keeping the last column as the floor.
-      if (m.header.length <= 1 || col < 0) return;
-      m.header.splice(col, 1);
-      for (const r of m.rows) r.splice(col, 1);
-      dispatchModel(view, wrap, m);
+    {
+      label: 'Sort',
+      icon: 'sort',
+      items: [
+        { label: 'Sort ascending', icon: 'sortAsc', action: () => sortTableByColumn(view, wrap, col, 1) },
+        { label: 'Sort descending', icon: 'sortDesc', action: () => sortTableByColumn(view, wrap, col, -1) },
+      ],
     },
-  });
+    {
+      label: 'Align',
+      icon: 'align',
+      items: alignItems.map(([label, align, icon]) => ({
+        label,
+        icon,
+        action: () => setColumnAlign(view, wrap, col, align),
+      })),
+    },
+  ];
 
   let dismissed = false;
   const dismiss = () => {
     if (dismissed) return;
     dismissed = true;
+    offTeardown(wrap, dismiss);
     menu.remove();
     document.removeEventListener('mousedown', onDocDown, true);
     document.removeEventListener('keydown', onDocKey, true);
@@ -1966,26 +2098,127 @@ function openCellMenu(
     if (event.target instanceof Node && menu.contains(event.target)) return;
     dismiss();
   };
-  const onDocKey = (event: KeyboardEvent) => {
-    if (event.key === 'Escape') dismiss();
+
+  // ---- sub-menu open / close ------------------------------------------
+  interface GroupEl {
+    btn: HTMLButtonElement;
+    sub: HTMLElement;
+  }
+  const groupEls: GroupEl[] = [];
+  const closeGroup = (g: GroupEl) => {
+    g.sub.hidden = true;
+    g.btn.setAttribute('aria-expanded', 'false');
+  };
+  const openGroup = (g: GroupEl) => {
+    for (const other of groupEls) if (other !== g) closeGroup(other);
+    g.sub.hidden = false;
+    g.btn.setAttribute('aria-expanded', 'true');
+    // Flip to the left if the flyout would leave the viewport.
+    g.sub.style.left = '';
+    g.sub.style.right = '';
+    const r = g.sub.getBoundingClientRect();
+    if (r.right > window.innerWidth) {
+      g.sub.style.left = 'auto';
+      g.sub.style.right = '100%';
+    }
+  };
+  const openGroupEl = () => groupEls.find((g) => !g.sub.hidden);
+  const enabledItems = (list: HTMLElement) =>
+    Array.from(
+      list.querySelectorAll<HTMLButtonElement>(
+        ':scope > .cm-atomic-table-menu-item:not(:disabled), :scope > .cm-atomic-table-menu-group > .cm-atomic-table-menu-item',
+      ),
+    ).filter((el) => !el.disabled);
+  const move = (items: HTMLElement[], from: Element | null, step: number) => {
+    if (!items.length) return;
+    const i = items.findIndex((el) => el === from);
+    const next = i < 0 ? (step > 0 ? 0 : items.length - 1) : (i + step + items.length) % items.length;
+    items[next].focus();
   };
 
-  for (const item of items) {
-    if (item === 'separator') {
-      const sep = document.createElement('div');
-      sep.className = 'cm-atomic-table-menu-sep';
-      menu.appendChild(sep);
-      continue;
+  const onDocKey = (event: KeyboardEvent) => {
+    const open = openGroupEl();
+    const active = document.activeElement;
+    const inSub = open !== undefined && active instanceof Node && open.sub.contains(active);
+    if (event.key === 'Escape') {
+      if (open) {
+        closeGroup(open);
+        open.btn.focus();
+        event.stopPropagation();
+      } else dismiss();
+      return;
     }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      // The capture listener runs first; without this the focused cell's own
+      // arrow handler then steals focus back from the menu.
+      event.stopPropagation();
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      if (open && inSub) move(enabledItems(open.sub), active, step);
+      else move(groupEls.map((g) => g.btn), active, step);
+    } else if (event.key === 'ArrowRight' && !inSub) {
+      const g = groupEls.find((x) => x.btn === active);
+      if (g) {
+        event.preventDefault();
+        event.stopPropagation();
+        openGroup(g);
+        enabledItems(g.sub)[0]?.focus();
+      }
+    } else if (event.key === 'ArrowLeft' && open && inSub) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeGroup(open);
+      open.btn.focus();
+    }
+  };
+
+  for (const group of groups) {
+    const wrapEl = document.createElement('div');
+    wrapEl.className = 'cm-atomic-table-menu-group';
+
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'cm-atomic-table-menu-item';
-    btn.textContent = item.label;
-    btn.addEventListener('click', () => {
-      item.action();
-      dismiss();
-    });
-    menu.appendChild(btn);
+    btn.setAttribute('role', 'menuitem');
+    btn.setAttribute('aria-haspopup', 'menu');
+    btn.setAttribute('aria-expanded', 'false');
+    const label = document.createElement('span');
+    label.className = 'cm-atomic-table-menu-label';
+    label.textContent = group.label;
+    const chevron = menuIcon('chevron');
+    chevron.classList.add('cm-atomic-table-menu-chevron');
+    btn.append(menuIcon(group.icon), label, chevron);
+
+    const sub = document.createElement('div');
+    sub.className = 'cm-atomic-table-submenu';
+    sub.setAttribute('role', 'menu');
+    sub.hidden = true;
+    for (const item of group.items) {
+      const leaf = document.createElement('button');
+      leaf.type = 'button';
+      leaf.className = 'cm-atomic-table-menu-item';
+      leaf.setAttribute('role', 'menuitem');
+      leaf.disabled = !!item.disabled;
+      const text = document.createElement('span');
+      text.className = 'cm-atomic-table-menu-label';
+      text.textContent = item.label;
+      leaf.append(menuIcon(item.icon), text);
+      leaf.addEventListener('click', () => {
+        item.action();
+        dismiss();
+        // The menu button had focus and is now gone; without this, keys
+        // (Ctrl+Z!) would go to the page body, not the editor.
+        view.focus();
+      });
+      sub.appendChild(leaf);
+    }
+
+    const g: GroupEl = { btn, sub };
+    groupEls.push(g);
+    btn.addEventListener('click', () => (sub.hidden ? openGroup(g) : closeGroup(g)));
+    wrapEl.addEventListener('pointerenter', () => openGroup(g));
+    wrapEl.append(btn, sub);
+    menu.appendChild(wrapEl);
   }
 
   document.body.appendChild(menu);
@@ -2006,6 +2239,7 @@ function openCellMenu(
     document.addEventListener('mousedown', onDocDown, true);
     document.addEventListener('keydown', onDocKey, true);
   }, 0);
+  onTeardown(wrap, dismiss);
 }
 
 function dispatchModelFromDom(
