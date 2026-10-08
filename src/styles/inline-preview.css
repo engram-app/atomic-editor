@@ -851,3 +851,45 @@
 .cm-atomic-table td[data-align="right"] {
   text-align: right;
 }
+
+/* Drag-selected table cells (box mode): no fill, just an accent outline around
+ * the bounding box. Each boundary cell draws its outer edges as inset
+ * box-shadows, composed from per-side custom properties so a corner cell gets
+ * both. Inner cells carry no edge class and stay unpainted. */
+.cm-atomic-table th.cm-atomic-table-cell-selected,
+.cm-atomic-table td.cm-atomic-table-cell-selected {
+  box-shadow:
+    var(--atomic-sel-top, 0 0 #0000),
+    var(--atomic-sel-right, 0 0 #0000),
+    var(--atomic-sel-bottom, 0 0 #0000),
+    var(--atomic-sel-left, 0 0 #0000);
+}
+
+.cm-atomic-table-cell-sel-top {
+  --atomic-sel-top: inset 0 2px 0 0 var(--atomic-editor-accent, #7c5cff);
+}
+
+.cm-atomic-table-cell-sel-right {
+  --atomic-sel-right: inset -2px 0 0 0 var(--atomic-editor-accent, #7c5cff);
+}
+
+.cm-atomic-table-cell-sel-bottom {
+  --atomic-sel-bottom: inset 0 -2px 0 0 var(--atomic-editor-accent, #7c5cff);
+}
+
+.cm-atomic-table-cell-sel-left {
+  --atomic-sel-left: inset 2px 0 0 0 var(--atomic-editor-accent, #7c5cff);
+}
+
+.cm-atomic-table-cell-selected .cm-atomic-table-cell-source {
+  caret-color: transparent;
+}
+
+.cm-atomic-table-selecting {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.cm-atomic-table-has-selection:focus {
+  outline: none;
+}

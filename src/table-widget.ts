@@ -846,6 +846,436 @@ function arrowIntoTable(dir: -1 | 1): (view: EditorView) => boolean {
   };
 }
 
+// ---- teardown registry -------------------------------------------------
+// Teardowns for document-level listeners a table's DOM owns (box selection, a
+// handle drag, the context menu). `TableWidget.destroy` runs them when CM drops
+// the DOM, so none act on a detached table.
+const teardowns = new WeakMap<HTMLElement, Set<() => void>>();
+
+function onTeardown(wrap: HTMLElement, fn: () => void): void {
+  let set = teardowns.get(wrap);
+  if (!set) teardowns.set(wrap, (set = new Set()));
+  set.add(fn);
+}
+
+// ---- drag cell selection ----------------------------------------------
+// Press in one cell and drag into another to select the rectangle of cells
+// between them ("box mode"). The selection is purely visual state on the DOM
+// (`.cm-atomic-table-cell-selected`); the document is untouched. Esc, a press
+// outside the table, a new press in it, or typing clears it. Works read-only.
+
+const CELL_SELECTED = 'cm-atomic-table-cell-selected';
+const TABLE_HAS_SELECTION = 'cm-atomic-table-has-selection';
+const TABLE_SELECTING = 'cm-atomic-table-selecting';
+
+function cellOf(target: EventTarget | null): HTMLElement | null {
+  return target instanceof Element ? target.closest<HTMLElement>('th, td') : null;
+}
+
+// Edge classes mark the box boundary; CSS draws the outline from them.
+const CELL_EDGES = ['top', 'right', 'bottom', 'left'].map(
+  (side) => `cm-atomic-table-cell-sel-${side}`,
+);
+
+function clearCellSelection(wrap: HTMLElement): void {
+  for (const c of wrap.querySelectorAll('.' + CELL_SELECTED)) {
+    c.classList.remove(CELL_SELECTED, ...CELL_EDGES);
+  }
+  wrap.classList.remove(TABLE_HAS_SELECTION);
+}
+
+function paintCellBox(wrap: HTMLElement, a: HTMLElement, b: HTMLElement): void {
+  const cells = getAllCells(wrap);
+  const cols = wrap.querySelectorAll('thead th').length || 1;
+  const ia = cells.indexOf(a);
+  const ib = cells.indexOf(b);
+  if (ia < 0 || ib < 0) return;
+  const r0 = Math.min(Math.floor(ia / cols), Math.floor(ib / cols));
+  const r1 = Math.max(Math.floor(ia / cols), Math.floor(ib / cols));
+  const c0 = Math.min(ia % cols, ib % cols);
+  const c1 = Math.max(ia % cols, ib % cols);
+  cells.forEach((cell, i) => {
+    const r = Math.floor(i / cols);
+    const c = i % cols;
+    const inside = r >= r0 && r <= r1 && c >= c0 && c <= c1;
+    cell.classList.toggle(CELL_SELECTED, inside);
+    cell.classList.toggle(CELL_EDGES[0], inside && r === r0);
+    cell.classList.toggle(CELL_EDGES[1], inside && c === c1);
+    cell.classList.toggle(CELL_EDGES[2], inside && r === r1);
+    cell.classList.toggle(CELL_EDGES[3], inside && c === c0);
+  });
+  wrap.classList.add(TABLE_HAS_SELECTION);
+}
+
+interface SelectionInfo {
+  cells: HTMLElement[];
+  cols: number;
+  selected: HTMLElement[];
+  r0: number;
+  r1: number;
+  c0: number;
+  c1: number;
+}
+
+// Backspace / Delete on a cell selection. A box covering whole rows or whole
+// columns removes them (the table's structure); any other box just clears the
+// cell contents. The header row can't be removed, so a full-row box that
+// includes it clears the header and drops the body rows. A box covering the
+// whole table is both "full rows" and "full columns": it only clears.
+function selectionInfo(wrap: HTMLElement): SelectionInfo | null {
+  const cells = getAllCells(wrap);
+  const cols = wrap.querySelectorAll('thead th').length || 1;
+  const selected = cells.filter((c) => c.classList.contains(CELL_SELECTED));
+  if (selected.length === 0) return null;
+  const idx = selected.map((c) => cells.indexOf(c));
+  const rows = idx.map((i) => Math.floor(i / cols));
+  const cs = idx.map((i) => i % cols);
+  return {
+    cells,
+    cols,
+    selected,
+    r0: Math.min(...rows),
+    r1: Math.max(...rows),
+    c0: Math.min(...cs),
+    c1: Math.max(...cs),
+  };
+}
+
+// Write a cell's raw markdown and re-render its decorated DOM. The widget's
+// `eq` ignores content, so edits that keep the table's shape must touch the DOM
+// directly and then sync the document with `dispatchModelFromDom`.
+function setCellRaw(cell: HTMLElement, text: string): void {
+  cell.dataset.raw = text;
+  const source = getCellSource(cell);
+  if (source) renderCellSourceDecorated(source);
+  refreshCellPreview(cell);
+}
+
+function clearSelectedCells(view: EditorView, info: SelectionInfo): void {
+  for (const cell of info.selected) setCellRaw(cell, '');
+  dispatchModelFromDom(view, info.selected[0], 'table.edit');
+}
+
+function deleteCellSelection(view: EditorView, wrap: HTMLElement): boolean {
+  if (view.state.facet(readOnlyFacet)) return false;
+  const info = selectionInfo(wrap);
+  if (!info) return false;
+  const { cells, cols, r0, r1, c0, c1 } = info;
+  const fullRows = c0 === 0 && c1 === cols - 1;
+  const fullCols = r0 === 0 && r1 === cells.length / cols - 1;
+  if (fullRows !== fullCols) {
+    if (fullCols) {
+      const m = readModelFromDom(wrap);
+      m.header.splice(c0, c1 - c0 + 1);
+      m.align.splice(c0, c1 - c0 + 1);
+      for (const r of m.rows) r.splice(c0, c1 - c0 + 1);
+      dispatchModel(view, wrap, m);
+    } else {
+      // Header included: the next remaining row is promoted to header.
+      editRows(view, wrap, (list) => list.splice(r0, r1 - r0 + 1));
+    }
+    view.focus();
+    return true;
+  }
+  clearSelectedCells(view, info);
+  return true;
+}
+
+// Edit the table's rows as one list, header first. The header is not special to
+// the user: any row can be inserted around, moved or removed, and whichever row
+// ends up first becomes the header, so the markdown stays valid (a GFM table
+// always has exactly one header row). The widget then rebuilds from the new
+// document because its DOM no longer matches it.
+function editRows(
+  view: EditorView,
+  wrap: HTMLElement,
+  fn: (list: string[][]) => void,
+): void {
+  const m = readModelFromDom(wrap);
+  const list = [m.header, ...m.rows];
+  fn(list);
+  if (list.length === 0) return;
+  m.header = list[0];
+  m.rows = list.slice(1);
+  dispatchModel(view, wrap, m);
+}
+
+// ---- copy / cut / paste on a cell selection ---------------------------
+// Copy and cut put the selected box on the clipboard as TSV (plus an HTML
+// table); cut then clears the contents. Paste fills a grid of TSV from the
+// box's top-left cell: columns past the right edge are clipped, extra rows
+// are appended. A single pasted value fills every selected cell.
+
+function cellText(cell: HTMLElement): string {
+  return readCellSource(cell).replace(/\\\|/g, '|');
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function writeCellSelectionToClipboard(info: SelectionInfo, data: DataTransfer): void {
+  const rows: string[][] = [];
+  for (let r = info.r0; r <= info.r1; r++) {
+    const row: string[] = [];
+    for (let c = info.c0; c <= info.c1; c++) row.push(cellText(info.cells[r * info.cols + c]));
+    rows.push(row);
+  }
+  data.setData('text/plain', rows.map((row) => row.join('\t')).join('\n'));
+  data.setData(
+    'text/html',
+    '<table><tbody>' +
+      rows.map((row) => '<tr>' + row.map((t) => `<td>${escapeHtml(t)}</td>`).join('') + '</tr>').join('') +
+      '</tbody></table>',
+  );
+}
+
+function parseClipboardGrid(text: string): string[][] | null {
+  const t = text.replace(/\r\n?/g, '\n').replace(/\n$/, '');
+  if (t === '') return null;
+  return t.split('\n').map((line) => line.split('\t'));
+}
+
+// Returns the pasted block's corner cells so the caller can select it, or
+// undefined when the paste rebuilt the table (or wrote nothing).
+function pasteIntoCellSelection(
+  view: EditorView,
+  wrap: HTMLElement,
+  info: SelectionInfo,
+  grid: string[][],
+): { a: HTMLElement; b: HTMLElement } | undefined {
+  const { cells, cols, r0, c0 } = info;
+  if (grid.length === 1 && grid[0].length === 1 && info.selected.length > 1) {
+    for (const cell of info.selected) setCellRaw(cell, grid[0][0]);
+    dispatchModelFromDom(view, info.selected[0], 'table.edit');
+    return;
+  }
+  const needRows = r0 + grid.length - cells.length / cols;
+  if (needRows > 0) {
+    const m = readModelFromDom(wrap);
+    for (let k = 0; k < needRows; k++) m.rows.push(m.header.map(() => ''));
+    grid.forEach((line, i) =>
+      line.forEach((v, j) => {
+        const tr = r0 + i;
+        const tc = c0 + j;
+        if (tc >= cols) return;
+        if (tr === 0) m.header[tc] = v;
+        else m.rows[tr - 1][tc] = v;
+      }),
+    );
+    dispatchModel(view, wrap, m);
+    view.focus();
+    return;
+  }
+  let first: HTMLElement | undefined;
+  grid.forEach((line, i) =>
+    line.forEach((v, j) => {
+      if (c0 + j >= cols) return;
+      const cell = cells[(r0 + i) * cols + c0 + j];
+      setCellRaw(cell, v);
+      first ??= cell;
+    }),
+  );
+  if (!first) return;
+  dispatchModelFromDom(view, first, 'table.edit');
+  const width = Math.max(...grid.map((line) => line.length));
+  return {
+    a: cells[r0 * cols + c0],
+    b: cells[(r0 + grid.length - 1) * cols + Math.min(cols - 1, c0 + width - 1)],
+  };
+}
+
+// Paste a grid with the caret in a single cell (no box selected): same fill,
+// anchored at that cell. The caret stays where it was.
+function pasteGridAtCell(view: EditorView, cell: HTMLElement, grid: string[][]): void {
+  const wrap = cell.closest<HTMLElement>('.cm-atomic-table');
+  if (!wrap) return;
+  const cells = getAllCells(wrap);
+  const cols = wrap.querySelectorAll('thead th').length || 1;
+  const i = cells.indexOf(cell);
+  if (i < 0) return;
+  const r = Math.floor(i / cols);
+  const c = i % cols;
+  pasteIntoCellSelection(
+    view,
+    wrap,
+    { cells, cols, selected: [cell], r0: r, r1: r, c0: c, c1: c },
+    grid,
+  );
+}
+
+function attachCellSelection(wrap: HTMLElement, view: EditorView): void {
+  let anchor: HTMLElement | null = null;
+  let pressed = false; // primary button is down after a press inside the table
+  let boxed = false; // the pointer has left the anchor cell: box mode
+  let watching = false;
+  let selAnchor: HTMLElement | null = null; // fixed corner of the current box
+  let selHead: HTMLElement | null = null; // free corner: moved by Shift-click / Shift+Arrow
+
+  const show = (a: HTMLElement, b: HTMLElement) => {
+    selAnchor = a;
+    selHead = b;
+    paintCellBox(wrap, a, b);
+  };
+
+  // Drop the caret / native text selection and keep keyboard focus on the
+  // table so key handling (copy, clear, Shift+Arrow) has a target.
+  const enterSelection = () => {
+    document.getSelection()?.removeAllRanges();
+    wrap.tabIndex = -1;
+    wrap.focus({ preventScroll: true });
+    watch();
+  };
+
+  const caretCell = (): HTMLElement | null => {
+    const a = document.getSelection()?.anchorNode;
+    const el = a && (a.nodeType === 1 ? (a as Element) : a.parentElement);
+    const c = el?.closest<HTMLElement>('th, td');
+    return c && wrap.contains(c) ? c : null;
+  };
+
+  const onDocDown = (e: PointerEvent) => {
+    if (!(e.target instanceof Node) || !wrap.contains(e.target)) clear();
+  };
+  const onDocKey = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') clear();
+  };
+
+  onTeardown(wrap, () => {
+    clear();
+    release();
+  });
+
+  const watch = () => {
+    if (watching) return;
+    watching = true;
+    document.addEventListener('pointerdown', onDocDown, true);
+    document.addEventListener('keydown', onDocKey, true);
+  };
+
+  function clear() {
+    selAnchor = null;
+    selHead = null;
+    clearCellSelection(wrap);
+    if (!watching) return;
+    watching = false;
+    document.removeEventListener('pointerdown', onDocDown, true);
+    document.removeEventListener('keydown', onDocKey, true);
+  }
+
+  const onMove = (e: PointerEvent) => {
+    if (!(e.buttons & 1)) {
+      release();
+      return;
+    }
+    const cell = cellOf(e.target);
+    if (!cell || !wrap.contains(cell) || !anchor) return;
+    if (!boxed) {
+      if (cell === anchor) return;
+      boxed = true;
+      wrap.classList.add(TABLE_SELECTING);
+      enterSelection();
+    }
+    show(anchor, cell);
+  };
+
+  function release() {
+    pressed = false;
+    boxed = false;
+    anchor = null;
+    wrap.classList.remove(TABLE_SELECTING);
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', release, true);
+    document.removeEventListener('pointercancel', release, true);
+  }
+
+  // Shift-click: extend the box from its anchor, or start one from the cell
+  // holding the caret.
+  wrap.addEventListener('mousedown', (e) => {
+    if (e.shiftKey && (selAnchor || caretCell())) e.preventDefault();
+  });
+
+  wrap.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || e.altKey || e.ctrlKey || e.metaKey) return;
+    const cell = cellOf(e.target);
+    if (!cell) return;
+    if (e.shiftKey) {
+      const base = selAnchor ?? caretCell();
+      if (!base) return;
+      e.preventDefault();
+      enterSelection();
+      show(base, cell);
+      return;
+    }
+    clear();
+    anchor = cell;
+    pressed = true;
+    boxed = false;
+    document.addEventListener('pointermove', onMove, true);
+    document.addEventListener('pointerup', release, true);
+    document.addEventListener('pointercancel', release, true);
+  });
+
+  wrap.addEventListener('selectstart', (e) => {
+    if (pressed && boxed) e.preventDefault();
+  });
+
+  wrap.addEventListener('input', clear);
+
+  wrap.addEventListener('copy', (e) => {
+    const info = selectionInfo(wrap);
+    if (!info || !e.clipboardData) return;
+    e.preventDefault();
+    writeCellSelectionToClipboard(info, e.clipboardData);
+  });
+
+  wrap.addEventListener('cut', (e) => {
+    const info = selectionInfo(wrap);
+    if (!info || !e.clipboardData) return;
+    e.preventDefault();
+    writeCellSelectionToClipboard(info, e.clipboardData);
+    if (!view.state.facet(readOnlyFacet)) clearSelectedCells(view, info);
+  });
+
+  wrap.addEventListener('paste', (e) => {
+    const info = selectionInfo(wrap);
+    if (!info || !e.clipboardData || view.state.facet(readOnlyFacet)) return;
+    const grid = parseClipboardGrid(e.clipboardData.getData('text/plain'));
+    if (!grid) return;
+    e.preventDefault();
+    const box = pasteIntoCellSelection(view, wrap, info, grid);
+    if (box) show(box.a, box.b);
+  });
+
+  wrap.addEventListener('keydown', (e) => {
+    if (e.shiftKey && !e.altKey && e.key.startsWith('Arrow') && selAnchor && selHead) {
+      const cells = getAllCells(wrap);
+      const cols = wrap.querySelectorAll('thead th').length || 1;
+      const rowCount = cells.length / cols;
+      const hi = cells.indexOf(selHead);
+      if (hi < 0 || cells.indexOf(selAnchor) < 0) return;
+      let r = Math.floor(hi / cols);
+      let c = hi % cols;
+      const far = e.ctrlKey || e.metaKey; // Ctrl/Cmd+Shift+Arrow: to the edge
+      if (e.key === 'ArrowLeft') c = far ? 0 : Math.max(0, c - 1);
+      else if (e.key === 'ArrowRight') c = far ? cols - 1 : Math.min(cols - 1, c + 1);
+      else if (e.key === 'ArrowUp') r = far ? 0 : Math.max(0, r - 1);
+      else if (e.key === 'ArrowDown') r = far ? rowCount - 1 : Math.min(rowCount - 1, r + 1);
+      else return;
+      e.preventDefault();
+      e.stopPropagation();
+      show(selAnchor, cells[r * cols + c]);
+      return;
+    }
+    if (e.key !== 'Backspace' && e.key !== 'Delete') return;
+    if (!wrap.classList.contains(TABLE_HAS_SELECTION)) return;
+    if (deleteCellSelection(view, wrap)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  });
+}
+
 // ---- widget ---------------------------------------------------------
 
 class TableWidget extends WidgetType {
@@ -904,6 +1334,7 @@ class TableWidget extends WidgetType {
     }
     table.appendChild(tbody);
 
+    attachCellSelection(wrap, view);
     return wrap;
   }
 
@@ -912,6 +1343,12 @@ class TableWidget extends WidgetType {
   // its own selection/click logic doesn't compete with contenteditable.
   ignoreEvent(): boolean {
     return true;
+  }
+
+  destroy(dom: HTMLElement): void {
+    const fns = teardowns.get(dom);
+    teardowns.delete(dom);
+    for (const fn of fns ?? []) fn();
   }
 }
 
@@ -1063,6 +1500,18 @@ function attachCellEditing(
   // and strip markup here, and `escapeCell` neutralizes any literal `|`
   // on serialize.
   source.addEventListener('paste', (event) => {
+    // Spreadsheet-style grid (tabs): spread it across cells from this one
+    // instead of flattening it into a single cell.
+    const data = event.clipboardData;
+    if (data && /\t/.test(data.getData('text/plain'))) {
+      const grid = parseClipboardGrid(data.getData('text/plain'));
+      if (grid && (grid.length > 1 || grid[0].length > 1)) {
+        event.preventDefault();
+        event.stopPropagation();
+        pasteGridAtCell(view, cell, grid);
+        return;
+      }
+    }
     event.preventDefault();
     const text = (event.clipboardData?.getData('text/plain') ?? '')
       .replace(/\s+/g, ' ')
@@ -1172,6 +1621,7 @@ function dispatchModel(
   const next = serializeTable(nextModel);
   view.dispatch({
     changes: { from: range.from, to: range.to, insert: next },
+    annotations: Transaction.userEvent.of('table.edit'),
   });
 }
 
@@ -1309,7 +1759,11 @@ function openCellMenu(
   }, 0);
 }
 
-function dispatchModelFromDom(view: EditorView, cell: HTMLElement): void {
+function dispatchModelFromDom(
+  view: EditorView,
+  cell: HTMLElement,
+  userEvent = 'input.type',
+): void {
   if (view.state.facet(readOnlyFacet)) return;
   const wrap = cell.closest<HTMLElement>('.cm-atomic-table');
   if (!wrap) return;
@@ -1323,10 +1777,11 @@ function dispatchModelFromDom(view: EditorView, cell: HTMLElement): void {
 
   view.dispatch({
     changes: { from: range.from, to: range.to, insert: next },
-    // Tag as typing so CM6's history coalesces consecutive cell edits
-    // into one undo group instead of one step per keystroke (each of
-    // which rewrites the whole table range).
-    annotations: Transaction.userEvent.of('input.type'),
+    // Typing is tagged `input.type` so CM6's history coalesces consecutive
+    // cell edits into one undo group instead of one step per keystroke (each
+    // of which rewrites the whole table range). Structural edits pass their
+    // own event so they never merge into a typing group.
+    annotations: Transaction.userEvent.of(userEvent),
   });
 }
 
