@@ -170,9 +170,9 @@ function getCellSource(cell: HTMLElement): HTMLElement | null {
 // ---- inline-mark parsing for cell source --------------------------------
 
 // Cells render a subset of inline markdown — bold, italic, strikethrough,
-// highlight, and links. No code spans (the `|` inside a backtick would silently
-// break row parsing), no lists/blocks (cells are single-line by
-// construction), no images (handled by the separate cell-preview strip).
+// highlight, inline code, wikilinks, comments, and links. No lists/blocks
+// (cells are single-line by construction), no images (handled by the
+// separate cell-preview strip).
 //
 // The parser is recursive so `**[text](url)**` nests cleanly, but each
 // mark is a straightforward delimiter pair. Highlights share their
@@ -185,6 +185,9 @@ type CellToken =
   | { type: 'em'; delim: '*' | '_'; children: CellToken[] }
   | { type: 'strike'; children: CellToken[] }
   | { type: 'highlight'; children: CellToken[] }
+  | { type: 'comment'; text: string }
+  | { type: 'code'; text: string }
+  | { type: 'wikilink'; rawTarget: string; rawLabel: string | null }
   | { type: 'link'; textChildren: CellToken[]; url: string };
 
 export function parseCellInline(raw: string): CellToken[] {
@@ -230,9 +233,16 @@ function matchCellMarkAt(
 ): { token: CellToken; end: number } | null {
   const rest = raw.slice(from);
 
+  // Comments (`%%…%%`, `<!-- -->`): opaque and shown greyed. Matched first so
+  // markdown inside a comment is not parsed; an unclosed one stays literal.
+  let m = rest.match(/^(?:%%[^\n]*?%%|<!--[^\n]*?-->)/);
+  if (m) {
+    return { token: { type: 'comment', text: m[0] }, end: from + m[0].length };
+  }
+
   // Bold with `**` or `__` — greedy on the outside, lazy on the
   // content so we catch the nearest closer.
-  let m = rest.match(/^\*\*([\s\S]+?)\*\*/);
+  m = rest.match(/^\*\*([\s\S]+?)\*\*/);
   if (m) {
     return {
       token: { type: 'strong', delim: '**', children: parseCellInline(m[1]) },
@@ -268,6 +278,21 @@ function matchCellMarkAt(
         ),
       },
       end: highlight.end,
+    };
+  }
+
+  // Inline code. Opaque: nothing inside is parsed, so `**x**` stays literal.
+  m = rest.match(/^`([^`\n]+)`/);
+  if (m) {
+    return { token: { type: 'code', text: m[1] }, end: from + m[0].length };
+  }
+
+  // Wikilink `[[target]]` / `[[target|label]]`. Must precede the `[text](url)` rule.
+  m = rest.match(/^\[\[([^\]\n|\\]+?)(?:\\?\|([^\]\n]*))?\]\]/);
+  if (m && m[1].trim()) {
+    return {
+      token: { type: 'wikilink', rawTarget: m[1], rawLabel: m[2] ?? null },
+      end: from + m[0].length,
     };
   }
 
@@ -378,6 +403,42 @@ function renderCellToken(tok: CellToken): Node {
     inner.appendChild(renderTokensTo(tok.children));
     wrap.appendChild(inner);
     wrap.appendChild(makeCellMark('=='));
+    return wrap;
+  }
+
+  if (tok.type === 'comment') {
+    const span = document.createElement('span');
+    span.className = 'cm-atomic-comment';
+    span.textContent = tok.text;
+    return span;
+  }
+
+  if (tok.type === 'code') {
+    const wrap = document.createElement('span');
+    wrap.className = 'cm-atomic-code-wrap';
+    wrap.appendChild(makeCellMark('`'));
+    const inner = document.createElement('span');
+    inner.className = 'cm-atomic-inline-code';
+    inner.textContent = tok.text;
+    wrap.appendChild(inner);
+    wrap.appendChild(makeCellMark('`'));
+    return wrap;
+  }
+
+  if (tok.type === 'wikilink') {
+    const wrap = document.createElement('span');
+    wrap.className = 'cm-atomic-wikilink-wrap';
+    wrap.appendChild(makeCellMark('[['));
+    if (tok.rawLabel != null) {
+      // Alias form: the target is syntax (revealed on caret entry), the label is the link.
+      wrap.appendChild(makeCellMark(`${tok.rawTarget}|`));
+    }
+    const link = document.createElement('span');
+    link.className = 'cm-atomic-wiki-link cm-atomic-wiki-link-resolved';
+    link.dataset.wikiLinkTarget = tok.rawTarget.trim();
+    link.textContent = tok.rawLabel ?? tok.rawTarget;
+    wrap.appendChild(link);
+    wrap.appendChild(makeCellMark(']]'));
     return wrap;
   }
 
@@ -495,6 +556,8 @@ const MARK_WRAP_CLASSES = [
   'cm-atomic-em-wrap',
   'cm-atomic-strike-wrap',
   'cm-atomic-link-wrap',
+  'cm-atomic-code-wrap',
+  'cm-atomic-wikilink-wrap',
 ];
 
 function isMarkWrap(el: Element): boolean {
@@ -751,16 +814,37 @@ function makeCell(
   // opened. We open on `click` (a proper popup-activation gesture, so
   // `window.open` isn't blocked) and block the caret on `pointerdown`.
   //
-  // In read-only mode there's no editable link text to protect, so the
-  // whole link (`.cm-atomic-link-wrap`) is the open target — matching
-  // the outer editor. In edit mode the open stays scoped to the
-  // trailing icon so the text itself remains clickable-to-edit.
+  // The whole link (`.cm-atomic-link-wrap`) is the open target in both
+  // modes, matching the outer editor (the host hides the icon, so an
+  // icon-only hit-zone would leave links unopenable while editing).
   const openTargetFromEvent = (event: Event): HTMLElement | null => {
     const target = event.target;
     if (!(target instanceof Element)) return null;
-    const selector = readOnly ? '.cm-atomic-link-wrap' : '.cm-atomic-link-icon';
-    return target.closest<HTMLElement>(selector);
+    return target.closest<HTMLElement>('.cm-atomic-link-wrap');
   };
+
+  // Wikilinks open on plain click, like the outer editor. The outer
+  // `wikiLinks()` click handler never sees these (the table widget sets
+  // `ignoreEvent() => true`), so route through `tableWikiLinkClickFacet`.
+  const wikiLinkFromEvent = (event: Event): HTMLElement | null => {
+    const target = event.target;
+    return target instanceof Element
+      ? target.closest<HTMLElement>('.cm-atomic-wiki-link')
+      : null;
+  };
+
+  source.addEventListener('pointerdown', (event) => {
+    if (event.button === 0 && wikiLinkFromEvent(event)) event.preventDefault();
+  });
+
+  source.addEventListener('click', (event) => {
+    if (event.button !== 0 || event.shiftKey || event.altKey) return;
+    const target = wikiLinkFromEvent(event)?.dataset.wikiLinkTarget;
+    if (!target) return;
+    event.preventDefault();
+    event.stopPropagation();
+    view.state.facet(tableWikiLinkClickFacet)(target);
+  });
 
   source.addEventListener('pointerdown', (event) => {
     if (event.button !== 0) return;
@@ -1325,6 +1409,11 @@ export interface TablesConfig {
    * '_blank', 'noopener,noreferrer')`.
    */
   onLinkClick?: (url: string) => void;
+  /**
+   * Called when the user clicks a `[[wikilink]]` rendered inside a table
+   * cell, with the raw (unresolved) target. Default: no-op.
+   */
+  onWikiLinkClick?: (target: string) => void;
 }
 
 const defaultLinkOpener = (url: string): void => {
@@ -1345,11 +1434,21 @@ export const tableLinkClickFacet = Facet.define<
   combine: (values) => values[0] ?? defaultLinkOpener,
 });
 
+export const tableWikiLinkClickFacet = Facet.define<
+  (target: string) => void,
+  (target: string) => void
+>({
+  combine: (values) => values[0] ?? (() => {}),
+});
+
 export function tables(config: TablesConfig = {}): Extension {
   return [
     tableField,
     treeProgressPlugin,
     ...(config.onLinkClick ? [tableLinkClickFacet.of(config.onLinkClick)] : []),
+    ...(config.onWikiLinkClick
+      ? [tableWikiLinkClickFacet.of(config.onWikiLinkClick)]
+      : []),
     // Prec.high so we run before the default Backspace binding.
     Prec.high(keymap.of([{ key: 'Backspace', run: backspaceAtTableBoundary }])),
   ];
