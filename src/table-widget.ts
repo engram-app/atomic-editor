@@ -803,7 +803,7 @@ function attachCellEditing(
     // textContent (not innerText) so `display: none` delimiters inside
     // mark wraps are still captured — otherwise a cell containing
     // `**bold**` would serialize to just `bold` on every keystroke.
-    const raw = (source.textContent ?? '').replace(/\s+/g, ' ').trim();
+    const raw = (source.textContent ?? '').replace(/\s/g, ' ');
     cell.dataset.raw = raw;
     const offset = getCaretCharOffset(source);
     renderCellSourceDecorated(source);
