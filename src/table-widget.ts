@@ -703,6 +703,8 @@ function findCurrentTableRange(
   view: EditorView,
   dom: HTMLElement,
 ): { from: number; to: number } | null {
+  // A detached table (rebuilt or removed widget) has no position to resolve.
+  if (!dom.isConnected) return null;
   const pos = view.posAtDOM(dom);
   if (pos < 0) return null;
   const tree = syntaxTree(view.state);
