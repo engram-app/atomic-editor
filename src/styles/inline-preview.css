@@ -464,8 +464,10 @@
 
 .cm-atomic-table table {
   border-collapse: collapse;
-  width: max-content;
-  min-width: 100%;
+  /* Fit the content (like Obsidian) instead of stretching to the page; long
+   * text wraps once the table reaches the container's width. */
+  width: auto;
+  min-width: 0;
   font-family: var(--atomic-editor-font, system-ui, sans-serif);
 }
 
@@ -475,7 +477,9 @@
   padding: 0.35em 0.6em;
   text-align: left;
   vertical-align: top;
-  min-width: 2em;
+  /* Tables shrink-wrap their content, so an empty column (e.g. one just added)
+   * needs a usable width of its own. */
+  min-width: 6em;
   min-height: 1.5em;
 }
 
@@ -892,4 +896,56 @@
 
 .cm-atomic-table-has-selection:focus {
   outline: none;
+}
+
+/* Add column / add row strips. `.cm-atomic-table-body` is the positioning box:
+ * it reserves a gutter (padding) past the table's right and bottom edges, and
+ * the strips live in that gutter, invisible until hovered. Padding, not margin,
+ * so CM6's height measurement stays honest (see .cm-atomic-table). */
+.cm-atomic-table-body {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  box-sizing: border-box;
+  /* Gutters: reorder handles above / left, add strips right / below. */
+  padding: 1rem 1.4rem 1.4rem 1rem;
+}
+
+.cm-atomic-table-add {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  border: 1px dashed var(--atomic-editor-accent, #7c5cff);
+  border-radius: 0.3rem;
+  background: color-mix(in srgb, var(--atomic-editor-accent, #7c5cff) 8%, transparent 92%);
+  color: var(--atomic-editor-accent, #7c5cff);
+  font: inherit;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.cm-atomic-table-add:hover,
+.cm-atomic-table-add:focus-visible {
+  opacity: 1;
+  background: color-mix(in srgb, var(--atomic-editor-accent, #7c5cff) 16%, transparent 84%);
+}
+
+.cm-atomic-table-add-col {
+  top: 1rem;
+  right: 0;
+  bottom: 1.4rem;
+  width: 1.2rem;
+}
+
+.cm-atomic-table-add-row {
+  left: 1rem;
+  right: 1.4rem;
+  bottom: 0;
+  height: 1.2rem;
 }

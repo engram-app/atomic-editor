@@ -1276,6 +1276,66 @@ function attachCellSelection(wrap: HTMLElement, view: EditorView): void {
   });
 }
 
+// ---- add column / add row strips ------------------------------------------
+// Hovering just past the table's right or bottom edge reveals an attached
+// strip (CSS fades it in); clicking it appends a column / row.
+
+function makeAddStrip(kind: 'col' | 'row', view: EditorView, wrap: HTMLElement): HTMLButtonElement {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = `cm-atomic-table-add cm-atomic-table-add-${kind}`;
+  btn.setAttribute('aria-label', kind === 'row' ? 'Add row' : 'Add column');
+  btn.textContent = '+';
+  // Mouse affordance only: keyboard users get Tab-past-the-last-cell and the
+  // context menu, and a hidden-until-hover button is a confusing tab stop.
+  btn.tabIndex = -1;
+  btn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (kind === 'row') appendRow(view, wrap);
+    else appendColumn(view, wrap);
+  });
+  return btn;
+}
+
+function appendColumn(view: EditorView, wrap: HTMLElement): void {
+  if (view.state.facet(readOnlyFacet)) return;
+  const range = findCurrentTableRange(view, wrap);
+  if (!range) return;
+  const model = readModelFromDom(wrap);
+  model.header.push('');
+  model.align.push(null);
+  for (const r of model.rows) r.push('');
+  view.dispatch({
+    changes: { from: range.from, to: range.to, insert: serializeTable(model) },
+    annotations: Transaction.userEvent.of('table.edit'),
+  });
+
+  // The column count changed, so the widget is rebuilt and `wrap` is detached.
+  // Find the fresh one by position (double rAF, same as appendRow) and put the
+  // caret in the new header cell.
+  const { from } = range;
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      if (view.state.facet(readOnlyFacet)) return;
+      for (const el of view.dom.querySelectorAll<HTMLElement>('.cm-atomic-table')) {
+        try {
+          if (view.posAtDOM(el) !== from) continue;
+        } catch {
+          continue; // posAtDOM throws on detached/transitional DOM
+        }
+        const headers = el.querySelectorAll<HTMLElement>('thead th');
+        const source = headers.length ? getCellSource(headers[headers.length - 1]) : null;
+        if (source) {
+          source.focus();
+          placeCaretAtEnd(source);
+        }
+        return;
+      }
+    });
+  });
+}
+
 // ---- widget ---------------------------------------------------------
 
 class TableWidget extends WidgetType {
@@ -1306,8 +1366,13 @@ class TableWidget extends WidgetType {
     const wrap = document.createElement('div');
     wrap.className = 'cm-atomic-table';
 
+    // `body` scrolls with the table and anchors the add-column / add-row
+    // strips at its right and bottom edges (see makeAddStrip).
+    const body = document.createElement('div');
+    body.className = 'cm-atomic-table-body';
     const table = document.createElement('table');
-    wrap.appendChild(table);
+    body.appendChild(table);
+    wrap.appendChild(body);
 
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
@@ -1334,6 +1399,9 @@ class TableWidget extends WidgetType {
     }
     table.appendChild(tbody);
 
+    if (!this.readOnly) {
+      body.append(makeAddStrip('col', view, wrap), makeAddStrip('row', view, wrap));
+    }
     attachCellSelection(wrap, view);
     return wrap;
   }
@@ -1823,6 +1891,7 @@ function appendRow(view: EditorView, wrap: HTMLElement): void {
   const next = serializeTable(model);
   view.dispatch({
     changes: { from: range.from, to: range.to, insert: next },
+    annotations: Transaction.userEvent.of('table.edit'),
   });
 
   // Adding a row changes the widget's row count, so `eq` returns
