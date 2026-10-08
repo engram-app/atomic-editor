@@ -852,6 +852,10 @@ function arrowIntoTable(dir: -1 | 1): (view: EditorView) => boolean {
 // the DOM, so none act on a detached table.
 const teardowns = new WeakMap<HTMLElement, Set<() => void>>();
 
+function offTeardown(wrap: HTMLElement, fn: () => void): void {
+  teardowns.get(wrap)?.delete(fn);
+}
+
 function onTeardown(wrap: HTMLElement, fn: () => void): void {
   let set = teardowns.get(wrap);
   if (!set) teardowns.set(wrap, (set = new Set()));
@@ -1336,6 +1340,182 @@ function appendColumn(view: EditorView, wrap: HTMLElement): void {
   });
 }
 
+// ---- row / column reorder handles ------------------------------------------
+// A handle strip in the gutter above each column and left of each body row.
+// They live inside the first-row / first-column cells so CSS positions them
+// with the cell, and are rebuilt (`syncHandles`) whenever cells are reordered.
+// Dragging one onto another row / column moves it; the move is done on the DOM
+// (the widget's `eq` ignores content) and then synced to the document.
+
+type HandleKind = 'row' | 'col';
+
+function makeHandle(kind: HandleKind, view: EditorView, wrap: HTMLElement): HTMLElement {
+  const h = document.createElement('div');
+  h.className = `cm-atomic-table-handle cm-atomic-table-handle-${kind}`;
+  h.setAttribute('role', 'button');
+  h.setAttribute('aria-label', kind === 'row' ? 'Move row' : 'Move column');
+  h.contentEditable = 'false';
+  h.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation(); // not a cell press: keep the box-selection handler out
+    startHandleDrag(view, wrap, kind, h, e);
+  });
+  return h;
+}
+
+function syncHandles(view: EditorView, wrap: HTMLElement): void {
+  for (const h of wrap.querySelectorAll('.cm-atomic-table-handle')) h.remove();
+  if (view.state.facet(readOnlyFacet)) return;
+  for (const th of wrap.querySelectorAll('thead th')) th.append(makeHandle('col', view, wrap));
+  for (const tr of wrap.querySelectorAll('tr')) {
+    tr.querySelector('th, td')?.append(makeHandle('row', view, wrap));
+  }
+}
+
+function clearDropMarks(wrap: HTMLElement): void {
+  for (const el of wrap.querySelectorAll<HTMLElement>('.cm-atomic-table-drop-target')) {
+    el.classList.remove('cm-atomic-table-drop-target');
+    delete el.dataset.drop;
+  }
+}
+
+function markDropTarget(wrap: HTMLElement, kind: HandleKind, from: number, to: number): void {
+  clearDropMarks(wrap);
+  const side = to > from ? 'after' : 'before';
+  const targets: (Element | undefined)[] =
+    kind === 'col'
+      ? Array.from(wrap.querySelectorAll('tr')).map((tr) => tr.children[to])
+      : Array.from(wrap.querySelectorAll('tr')[to]?.children ?? []);
+  for (const el of targets) {
+    if (!(el instanceof HTMLElement)) continue;
+    el.classList.add('cm-atomic-table-drop-target');
+    el.dataset.drop = `${kind}-${side}`;
+  }
+}
+
+// Index of a cell's row among ALL rows, header first (the header is row 0).
+function rowAllIndex(cell: HTMLElement): number {
+  const tr = cell.closest('tr');
+  const wrap = cell.closest('.cm-atomic-table');
+  return tr && wrap ? Array.from(wrap.querySelectorAll('tr')).indexOf(tr) : -1;
+}
+
+function moveTableLine(
+  view: EditorView,
+  wrap: HTMLElement,
+  kind: HandleKind,
+  from: number,
+  to: number,
+): void {
+  if (kind === 'col') {
+    for (const tr of wrap.querySelectorAll('tr')) {
+      const cs = Array.from(tr.children);
+      if (!cs[from] || !cs[to]) continue;
+      tr.insertBefore(cs[from], to > from ? cs[to].nextSibling : cs[to]);
+    }
+  } else {
+    editRows(view, wrap, (list) => {
+      if (!list[from] || !list[to]) return;
+      const [moved] = list.splice(from, 1);
+      list.splice(to, 0, moved);
+    });
+    return;
+  }
+  syncHandles(view, wrap);
+  const any = wrap.querySelector<HTMLElement>('th, td');
+  if (any) dispatchModelFromDom(view, any, 'table.edit');
+}
+
+function startHandleDrag(
+  view: EditorView,
+  wrap: HTMLElement,
+  kind: HandleKind,
+  handle: HTMLElement,
+  down: PointerEvent,
+): void {
+  const owner = handle.parentElement;
+  if (!owner) return;
+  const from = kind === 'col' ? cellColIndex(owner) : rowAllIndex(owner);
+  if (from < 0) return;
+  let to = from;
+  const horizontal = kind === 'col';
+  const items = () =>
+    Array.from(wrap.querySelectorAll<HTMLElement>(horizontal ? 'thead th' : 'tr'));
+
+  // The handle slides along its rail (the table's extent on its axis) with the
+  // pointer, unsnapped; the landing slot is marked separately.
+  const startPointer = horizontal ? down.clientX : down.clientY;
+  const startRect = handle.getBoundingClientRect();
+  const railRects = items().map((el) => el.getBoundingClientRect());
+  const hasLayout = railRects.some((r) => r.width > 0 || r.height > 0);
+  const railMin = hasLayout
+    ? horizontal
+      ? railRects[0].left - startRect.left
+      : railRects[0].top - startRect.top
+    : -Infinity;
+  const railMax = hasLayout
+    ? horizontal
+      ? railRects[railRects.length - 1].right - startRect.right
+      : railRects[railRects.length - 1].bottom - startRect.bottom
+    : Infinity;
+  const slide = (e: PointerEvent) => {
+    const raw = (horizontal ? e.clientX : e.clientY) - startPointer;
+    const d = Math.min(Math.max(raw, railMin), railMax);
+    handle.style.transform = horizontal ? `translateX(${d}px)` : `translateY(${d}px)`;
+  };
+  // The slot under the pointer's position along the rail, wherever the pointer
+  // is across it. Without layout (tests), fall back to the element under it.
+  const slotAt = (e: PointerEvent): number => {
+    if (hasLayout) {
+      const p = horizontal ? e.clientX : e.clientY;
+      const i = railRects.findIndex((r) => p < (horizontal ? r.right : r.bottom));
+      return i < 0 ? railRects.length - 1 : i;
+    }
+    const cell = cellOf(e.target);
+    if (!cell || !wrap.contains(cell)) return -1;
+    return horizontal ? cellColIndex(cell) : rowAllIndex(cell);
+  };
+
+  // Keep the handle visible for the whole drag, wherever the pointer is
+  // (its hover state only exists while the pointer is over it).
+  handle.classList.add('cm-atomic-table-handle-dragging');
+  wrap.classList.add('cm-atomic-table-dragging');
+
+  const end = (commit: boolean) => {
+    offTeardown(wrap, cancel);
+    handle.classList.remove('cm-atomic-table-handle-dragging');
+    wrap.classList.remove('cm-atomic-table-dragging');
+    handle.style.transform = '';
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    document.removeEventListener('pointercancel', onCancel, true);
+    clearDropMarks(wrap);
+    if (commit && to !== from) {
+      moveTableLine(view, wrap, kind, from, to);
+      view.focus(); // so Ctrl+Z reaches the editor
+    }
+  };
+  const onUp = () => end(true);
+  const onCancel = () => end(false);
+  const cancel = onCancel;
+  onTeardown(wrap, cancel);
+  const onMove = (e: PointerEvent) => {
+    if (!(e.buttons & 1)) {
+      end(false);
+      return;
+    }
+    slide(e);
+    const t = slotAt(e);
+    if (t < 0) return;
+    to = t;
+    markDropTarget(wrap, kind, from, to);
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
+  document.addEventListener('pointercancel', onCancel, true);
+}
+
 // ---- widget ---------------------------------------------------------
 
 class TableWidget extends WidgetType {
@@ -1401,6 +1581,7 @@ class TableWidget extends WidgetType {
 
     if (!this.readOnly) {
       body.append(makeAddStrip('col', view, wrap), makeAddStrip('row', view, wrap));
+      syncHandles(view, wrap);
     }
     attachCellSelection(wrap, view);
     return wrap;
