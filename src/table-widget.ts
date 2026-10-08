@@ -1516,9 +1516,48 @@ function startHandleDrag(
   document.addEventListener('pointercancel', onCancel, true);
 }
 
+// ---- undo / redo ------------------------------------------------------
+// Key events inside the widget never reach the editor's keymap (`ignoreEvent`),
+// so Ctrl/Cmd+Z / Shift+Z / Y did nothing in or beside a table. Re-dispatch
+// them on the content DOM, where the host's undo keymap listens; swallow the
+// original only if something handled it.
+
+function attachUndoForwarding(wrap: HTMLElement, view: EditorView): void {
+  wrap.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.isComposing) return;
+    const k = e.key.toLowerCase();
+    if (k !== 'z' && k !== 'y') return;
+    if (view.state.facet(readOnlyFacet)) return;
+    const forwarded = new KeyboardEvent('keydown', {
+      key: e.key,
+      code: e.code,
+      keyCode: e.keyCode,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      shiftKey: e.shiftKey,
+      bubbles: true,
+      cancelable: true,
+    });
+    view.contentDOM.dispatchEvent(forwarded);
+    if (forwarded.defaultPrevented) {
+      e.preventDefault();
+      e.stopPropagation();
+      view.focus();
+    }
+  });
+}
+
 // ---- widget ---------------------------------------------------------
 
+// CM6 calls `eq` in either direction (old.eq(new) when diffing decorations,
+// new.eq(old) when syncing the view) and, when it reuses the DOM, keeps the NEW
+// widget object. A construction counter tells the two apart.
+let widgetSeq = 0;
+
 class TableWidget extends WidgetType {
+  readonly seq = widgetSeq++;
+  private dom: HTMLElement | undefined;
+
   constructor(readonly model: TableModel, readonly readOnly: boolean) {
     super();
   }
@@ -1539,6 +1578,18 @@ class TableWidget extends WidgetType {
     // Alignment lives in the separator row, not the cells, so a change there
     // must rebuild the DOM (cells carry it as data-align).
     if (JSON.stringify(other.model.align) !== JSON.stringify(this.model.align)) return false;
+    // Reuse the DOM only if it already shows the incoming content. Typing
+    // updates the DOM first and the document second, so a keystroke matches
+    // (the caret survives); an undo or a remote edit does not (rebuild, or
+    // the cells would keep showing stale text). Compared as serialized
+    // markdown so escaping and trimming are the same on both sides.
+    if (other === this) return true;
+    const [older, newer] = this.seq < other.seq ? [this, other] : [other, this];
+    const dom = older.dom ?? newer.dom;
+    if (dom && serializeTable(readModelFromDom(dom)) !== serializeTable(newer.model)) return false;
+    // The newer widget is the one CM6 keeps when it reuses the DOM; hand it
+    // the DOM so the next comparison can still check it.
+    if (dom) newer.dom = dom;
     return true;
   }
 
@@ -1584,6 +1635,8 @@ class TableWidget extends WidgetType {
       syncHandles(view, wrap);
     }
     attachCellSelection(wrap, view);
+    attachUndoForwarding(wrap, view);
+    this.dom = wrap;
     return wrap;
   }
 
